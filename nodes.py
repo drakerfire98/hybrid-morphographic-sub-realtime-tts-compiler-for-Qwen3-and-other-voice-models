@@ -100,6 +100,7 @@ except ImportError:
 # Global model cache
 _MODEL_CACHE = {}
 
+
 def check_and_download_models():
     """Check for local models and trigger batch download if missing"""
     global _MODELS_CHECKED
