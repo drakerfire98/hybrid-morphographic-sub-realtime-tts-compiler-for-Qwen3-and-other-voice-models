@@ -356,13 +356,16 @@ class VoiceCloneNode:
                 # (waveform, sr) or (sr, waveform)
                 a0, a1 = audio_tensor
                 if isinstance(a0, (int, float)) and isinstance(a1, (list, np.ndarray, torch.Tensor)):
-                    sr = int(a0); waveform = np.asarray(a1)
+                    sr = int(a0)
+                    waveform = np.asarray(a1)
                 elif isinstance(a1, (int, float)) and isinstance(a0, (list, np.ndarray, torch.Tensor)):
-                    sr = int(a1); waveform = np.asarray(a0)
+                    sr = int(a1)
+                    waveform = np.asarray(a0)
             elif isinstance(audio_tensor, list):
                 # maybe [waveform, sr]
                 if len(audio_tensor) == 2 and isinstance(audio_tensor[0], (list, np.ndarray)) and isinstance(audio_tensor[1], (int, float)):
-                    waveform = np.asarray(audio_tensor[0]); sr = int(audio_tensor[1])
+                    waveform = np.asarray(audio_tensor[0])
+                    sr = int(audio_tensor[1])
         except Exception:
             pass
         # Normalize to 1-D numpy float32 array (model expects 1-D waveforms)
