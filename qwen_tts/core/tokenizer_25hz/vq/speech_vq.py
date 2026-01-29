@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import sox
+# 'sox' import moved to XVectorExtractor.__init__ for lazy loading
 import copy
 import torch
 import operator
@@ -118,10 +118,16 @@ class MelSpectrogramFeatures(nn.Module):
 class XVectorExtractor(nn.Module):
     def __init__(self, audio_codec_with_xvector):
         super().__init__()
+        import sox  # Lazy import - only needed when using 25Hz tokenizer
         option = onnxruntime.SessionOptions()
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
-        providers = ["CPUExecutionProvider"]
+        # GPU-ONLY: Use CUDA provider with TensorRT fallback for maximum speed
+        providers = [
+            ("TensorrtExecutionProvider", {"device_id": 0}),
+            ("CUDAExecutionProvider", {"device_id": 0}),
+            "CPUExecutionProvider",  # Only if GPU fails
+        ]
         self.ort_session = onnxruntime.InferenceSession(audio_codec_with_xvector, sess_options=option, providers=providers)
 
         self.tfm = sox.Transformer()

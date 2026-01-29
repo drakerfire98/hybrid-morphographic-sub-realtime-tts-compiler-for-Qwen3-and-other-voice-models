@@ -24,7 +24,34 @@ import librosa
 import numpy as np
 import soundfile as sf
 import torch
+from queue import Queue
+from threading import Thread
 from transformers import AutoConfig, AutoModel, AutoProcessor
+from transformers.generation.streamers import BaseStreamer
+from queue import Queue
+from threading import Thread
+
+
+class AudioCodeStreamer(BaseStreamer):
+    def __init__(self, timeout=None):
+        self.queue = Queue()
+        self.timeout = timeout
+        self.stop_signal = object()
+    
+    def put(self, value):
+        self.queue.put(value)
+        
+    def end(self):
+        self.queue.put(self.stop_signal)
+        
+    def __iter__(self):
+        while True:
+            value = self.queue.get(timeout=self.timeout)
+            if value == self.stop_signal:
+                break
+            yield value
+
+from transformers.generation.streamers import BaseStreamer
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
 
@@ -35,6 +62,26 @@ AudioLike = Union[
 ]
 
 MaybeList = Union[Any, List[Any]]
+
+
+class AudioCodeStreamer(BaseStreamer):
+    def __init__(self, timeout=None):
+        self.queue = Queue()
+        self.timeout = timeout
+        self.stop_signal = object()
+    
+    def put(self, value):
+        self.queue.put(value)
+        
+    def end(self):
+        self.queue.put(self.stop_signal)
+        
+    def __iter__(self):
+        while True:
+            value = self.queue.get(timeout=self.timeout)
+            if value == self.stop_signal:
+                break
+            yield value
 
 
 @dataclass
@@ -600,6 +647,103 @@ class Qwen3TTSModel:
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
+        if not non_streaming_mode:
+            # STREAMING MODE
+            streamer = AudioCodeStreamer()
+            gen_kwargs["streamer"] = streamer
+            
+            thread = Thread(target=self.model.generate, kwargs={
+                "input_ids": input_ids,
+                "ref_ids": ref_ids,
+                "voice_clone_prompt": voice_clone_prompt_dict,
+                "languages": languages,
+                "non_streaming_mode": False,
+                **gen_kwargs
+            })
+            thread.start()
+            
+            def stream_generator():
+                # Setup Config IDs
+                eos_token_id = self.model.generation_config.eos_token_id
+                if isinstance(eos_token_id, list):
+                    eos_token_id = eos_token_id[0]
+                
+                talker_cfg = getattr(self.model.config, "talker_config", None)
+                pad_id = 0
+                codec_eos = None
+                if talker_cfg:
+                    pad_id = getattr(talker_cfg, "codec_pad_id", 0)
+                    codec_eos = getattr(talker_cfg, "codec_eos_token_id", None)
+                
+                batch_buffer = [] 
+                
+                for new_token in streamer:
+                    # new_token: [Batch, 1]
+                    try:
+                        token_val = new_token.item()
+                        # Check EOS (Text and Codec)
+                        if token_val == eos_token_id:
+                            break
+                        if codec_eos is not None and token_val == codec_eos:
+                            break
+                        if token_val > 65535: # Safety
+                            continue
+
+                        batch_buffer.append(new_token)
+                        
+                        # Process every 2 tokens (or whatever chunk size)
+                        # Decoding 1 token fails with RoPE? Try 2.
+                        if len(batch_buffer) >= 2:
+                            # Stack: [Batch, 2]? 
+                            # new_token is [B, 1].
+                            # cat(batch_buffer, dim=1) -> [B, 2]
+                            
+                            seq_codes = torch.cat(batch_buffer, dim=1) # [B, 2]
+                            batch_buffer = [] # Clear
+                            
+                            # Pad Layers 1-15
+                            # seq_codes: [B, Seq]
+                            # Unsqueeze to [B, 1, Seq]
+                            ac = seq_codes.unsqueeze(1) 
+                            
+                            device = ac.device
+                            dtype = ac.dtype
+                            
+                            # Padding: [B, 15, Seq]
+                            # Use pad_id * ones
+                            padding = torch.full((ac.shape[0], 15, ac.shape[2]), pad_id, device=device, dtype=dtype)
+                            
+                            full_codes = torch.cat([ac, padding], dim=1) # [B, 16, Seq]
+                            
+                            # Decode
+                            wavs_chunk, _ = self.model.speech_tokenizer.decode([{"audio_codes": full_codes}])
+                            # Output is [B, AudioSamples]
+                            
+                            # Yield
+                            yield wavs_chunk[0]
+                            
+                    except Exception as e:
+                        # print(f"Stream Error: {e}")
+                        pass
+                
+                # Flush remaining buffer
+                if batch_buffer:
+                    try:
+                        seq_codes = torch.cat(batch_buffer, dim=1)
+                        if seq_codes.shape[1] > 0:
+                             ac = seq_codes.unsqueeze(1)
+                             padding = torch.full((ac.shape[0], 15, ac.shape[2]), pad_id, device=ac.device, dtype=ac.dtype)
+                             full_codes = torch.cat([ac, padding], dim=1)
+                             wavs_chunk, _ = self.model.speech_tokenizer.decode([{"audio_codes": full_codes}])
+                             yield wavs_chunk[0]
+                    except:
+                        pass
+                
+                thread.join()
+            
+            return stream_generator(), 24000
+
+        # BLOCKING MODE
         talker_codes_list, _ = self.model.generate(
             input_ids=input_ids,
             ref_ids=ref_ids,

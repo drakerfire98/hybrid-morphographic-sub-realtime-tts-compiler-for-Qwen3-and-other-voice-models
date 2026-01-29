@@ -1632,22 +1632,47 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         # Generate
         else:
             last_id_hidden = self.get_input_embeddings()(input_ids)
-            predictor_result = self.code_predictor.generate(
-                inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
-                max_new_tokens=self.config.num_code_groups - 1,
-                do_sample=subtalker_dosample,
-                top_p=subtalker_top_p,
-                top_k=subtalker_top_k,
-                temperature=subtalker_temperature,
-                output_hidden_states=True,
-                return_dict_in_generate=True,
-            )
-            codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
-            codec_hiddens = torch.cat(
-                [last_id_hidden]
-                + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
-                dim=1,
-            )
+            
+            # FAST PATH: Skip NAR code_predictor for streaming (sub-second latency)
+            skip_nar = kwargs.get("skip_code_predictor", False)
+            
+            if not skip_nar:
+                # Original: Run code_predictor for high-quality audio
+                predictor_result = self.code_predictor.generate(
+                    inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
+                    max_new_tokens=self.config.num_code_groups - 1,
+                    do_sample=subtalker_dosample,
+                    top_p=subtalker_top_p,
+                    top_k=subtalker_top_k,
+                    temperature=subtalker_temperature,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
+                )
+                codec_ids = torch.cat((input_ids, predictor_result.sequences), dim=-1)
+                codec_hiddens = torch.cat(
+                    [last_id_hidden]
+                    + [self.code_predictor.get_input_embeddings()[i](predictor_result.sequences[..., i:i+1]) for i in range(self.config.num_code_groups - 1)],
+                    dim=1,
+                )
+            else:
+                # FAST PATH: Use zeros for L1-15, only L0 matters for AR
+                device = input_ids.device
+                dtype = input_ids.dtype
+                batch_size = input_ids.shape[0]
+                
+                # Create zero sequences for Layers 1-15
+                zero_seqs = torch.zeros((batch_size, self.config.num_code_groups - 1), dtype=dtype, device=device)
+                codec_ids = torch.cat((input_ids, zero_seqs), dim=-1)
+                
+                # Create zero embeddings for Layers 1-15
+                pad_embeds = []
+                embed_layers = self.code_predictor.get_input_embeddings()
+                for i in range(self.config.num_code_groups - 1):
+                    z = torch.zeros((batch_size, 1), dtype=dtype, device=device)
+                    pad_embeds.append(embed_layers[i](z))
+                
+                codec_hiddens = torch.cat([last_id_hidden] + pad_embeds, dim=1)
+            
             inputs_embeds = codec_hiddens.sum(1, keepdim=True)
 
             if generation_step < trailing_text_hidden.shape[1]:
@@ -2013,6 +2038,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
             "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
         }
+        if "streamer" in kwargs:
+            talker_kwargs["streamer"] = kwargs["streamer"]
         
         talker_input_embeds = [[] for _ in range(len(input_ids))]
 

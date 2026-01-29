@@ -32,8 +32,17 @@ except ImportError:
     try:
         from flash_attn.flash_attn_interface import flash_attn_unpadded_func as flash_attn_varlen_func
     except ImportError:
-        print("\n********\nWarning: flash-attn is not installed. Will only run the manual PyTorch version. Please install flash-attn for faster inference.\n********\n ")
-        flash_attn_varlen_func = None
+        try:
+            # Flash Attention 3 (windreamer package)
+            from flash_attn_3 import flash_attn_varlen_func as flash_attn_varlen_func
+        except ImportError:
+            try:
+                # FA3 might have different function names
+                from flash_attn_3 import flash_attn_func as flash_attn_varlen_func
+            except ImportError:
+                print("\n********\nWarning: flash-attn/flash_attn_3 not installed. Will only run the manual PyTorch version.\n********\n ")
+                flash_attn_varlen_func = None
+
 
 
 N_FFT = 400
