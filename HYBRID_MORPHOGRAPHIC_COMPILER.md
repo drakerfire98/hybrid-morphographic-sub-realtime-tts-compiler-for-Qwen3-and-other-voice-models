@@ -306,7 +306,17 @@ Potential targets include EnCodec-based models, SoundStream-based models, and fu
 - PyTorch 2.9+ with CUDA
 - `flash-attn` (compiled for your PyTorch version)
 - `scipy` (for Butterworth filter)
-- NVIDIA GPU with ≥8GB VRAM (tested on consumer hardware)
+- NVIDIA GPU with ≥4GB VRAM
+
+**Measured VRAM Usage (bfloat16):**
+
+| Phase | VRAM |
+|-------|------|
+| Model load | 2.02 GB |
+| After voice prompt creation | 2.06 GB |
+| Peak during generation | **2.31 GB** |
+
+The hybrid morphographic compiler adds **zero additional VRAM** — it reuses the existing model weights and KV cache. The crossbar tail weight cache is a view over existing `lm_head` parameters, not a copy.
 
 ### 7.2 Quick Start
 
