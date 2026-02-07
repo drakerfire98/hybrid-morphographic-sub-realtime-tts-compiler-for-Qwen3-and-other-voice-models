@@ -1703,6 +1703,9 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 cos_full, sin_full = mc['cos'], mc['sin']
                 num_layers = len(cp_model.layers)
                 
+                # HYBRID: sequential for first SEQ_GROUPS, crossbar for rest
+                SEQ_GROUPS = 7  # sequential groups (voice identity)
+                
                 # === PREFILL: positions [0, 1] ===
                 prefill_input = torch.cat((past_hidden, last_id_hidden), dim=1)
                 prefill_input = cp.small_to_mtp_projection(prefill_input)
@@ -1711,8 +1714,6 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 cos_pre = cos_full[:, :2, :]
                 sin_pre = sin_full[:, :2, :]
                 
-                # With flash_attention_2, pass None as attention_mask
-                # The kernel handles causality internally
                 h = prefill_input
                 for layer in cp_model.layers:
                     layer_out = layer(
@@ -1728,9 +1729,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 token_0 = _sample(cp.lm_head[0](h[:, -1, :]))
                 pred_tokens = [token_0]
                 
-                # === DECODE: positions [2..16], one at a time ===
+                # === SEQUENTIAL: groups 1..SEQ_GROUPS-1 ===
                 prev_token = token_0
-                for step in range(1, total_groups):
+                last_hidden = h[:, -1, :]
+                for step in range(1, min(SEQ_GROUPS, total_groups)):
                     pos = step + 1
                     
                     step_embed = embed_layers[step - 1](prev_token)
@@ -1750,10 +1752,28 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                         )
                         h = layer_out[0]
                     h = cp_model.norm(h)
+                    last_hidden = h[:, -1, :]
                     
-                    token_i = _sample(cp.lm_head[step](h[:, -1, :]))
+                    token_i = _sample(cp.lm_head[step](last_hidden))
                     pred_tokens.append(token_i)
                     prev_token = token_i
+                
+                # === CROSSBAR FINISH: groups SEQ_GROUPS..14 ===
+                # Use the last sequential hidden state to predict remaining
+                # groups in one shot via fused lm_head projections
+                if SEQ_GROUPS < total_groups:
+                    remaining = total_groups - SEQ_GROUPS
+                    # Stack remaining lm_head weights
+                    if not hasattr(self, '_crossbar_tail_weight'):
+                        self._crossbar_tail_weight = torch.stack(
+                            [cp.lm_head[i].weight.data for i in range(SEQ_GROUPS, total_groups)]
+                        )  # [remaining, V, H]
+                    
+                    # Fused prediction: [remaining, V, H] × [B, H] → [B, remaining, V]
+                    tail_logits = torch.einsum('gvh,bh->bgv', self._crossbar_tail_weight, last_hidden)
+                    
+                    for j in range(remaining):
+                        pred_tokens.append(_sample(tail_logits[:, j, :]))
                 
                 # Build codec_ids and embeddings
                 pred_seqs = torch.cat(pred_tokens, dim=-1)
