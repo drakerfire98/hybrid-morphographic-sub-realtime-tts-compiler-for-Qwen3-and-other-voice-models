@@ -208,10 +208,12 @@ class Qwen3TTSTalkerCodePredictorConfig(PretrainedConfig):
         layer_types=None,
         attention_dropout=0,
         num_code_groups=32,
+        pad_token_id=0,  # Explicit pad token to avoid HuggingFace defaulting to eos_token_id
         **kwargs,
     ):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            pad_token_id=pad_token_id,  # Pass to parent so generate() uses correct padding
             **kwargs,
         )
         self.vocab_size = vocab_size
@@ -400,10 +402,12 @@ class Qwen3TTSTalkerConfig(PretrainedConfig):
         spk_id=None,
         spk_is_dialect=None,
         codec_language_id=None,
+        pad_token_id=0,  # Explicit pad token for HuggingFace generate()
         **kwargs,
     ):
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
+            pad_token_id=pad_token_id,  # Pass to parent to avoid defaulting to eos_token_id
             **kwargs,
         )
         self.vocab_size = vocab_size

@@ -156,6 +156,14 @@ class Qwen3TTSModel:
         AutoModel.register(Qwen3TTSConfig, Qwen3TTSForConditionalGeneration)
         AutoProcessor.register(Qwen3TTSConfig, Qwen3TTSProcessor)
 
+        # RTX 5090 Blackwell fix: Disable async loading to prevent meta tensor errors
+        import os
+        os.environ['HF_DEACTIVATE_ASYNC_LOAD'] = '1'  # Force synchronous loading
+        
+        # Get target device
+        device_map = kwargs.get('device_map', 'cuda:0')
+        
+        # Load directly to GPU with synchronous loading (Blackwell-safe)
         model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
         if not isinstance(model, Qwen3TTSForConditionalGeneration):
             raise TypeError(
@@ -648,100 +656,76 @@ class Qwen3TTSModel:
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
 
         if not non_streaming_mode:
-            # STREAMING MODE
-            streamer = AudioCodeStreamer()
-            gen_kwargs["streamer"] = streamer
+            # STREAMING MODE — Thread-based pipeline
+            # The HuggingFace streamer only captures L0 tokens, but decoding
+            # needs all 16 codec layers (available only after generate() ends).
+            # So we generate in a thread and yield the full audio once ready.
+            # This enables sentence-level pipelining: play sentence N while
+            # generating sentence N+1.
             
-            thread = Thread(target=self.model.generate, kwargs={
-                "input_ids": input_ids,
-                "ref_ids": ref_ids,
-                "voice_clone_prompt": voice_clone_prompt_dict,
-                "languages": languages,
-                "non_streaming_mode": False,
-                **gen_kwargs
-            })
+            import queue
+            result_queue = queue.Queue()
+            
+            def gen_thread():
+                try:
+                    # Run blocking generation
+                    talker_codes_list, _ = self.model.generate(
+                        input_ids=input_ids,
+                        ref_ids=ref_ids,
+                        voice_clone_prompt=voice_clone_prompt_dict,
+                        languages=languages,
+                        non_streaming_mode=True,  # Must be True to get full codec
+                        **gen_kwargs,
+                    )
+                    
+                    # Decode with ref_code prefix for proper voice cloning
+                    codes_for_decode = []
+                    for i, codes in enumerate(talker_codes_list):
+                        ref_code_list = voice_clone_prompt_dict.get("ref_code", None)
+                        if ref_code_list is not None and ref_code_list[i] is not None:
+                            codes_for_decode.append(
+                                torch.cat([ref_code_list[i].to(codes.device), codes], dim=0)
+                            )
+                        else:
+                            codes_for_decode.append(codes)
+                    
+                    wavs_all, fs = self.model.speech_tokenizer.decode(
+                        [{"audio_codes": c} for c in codes_for_decode]
+                    )
+                    
+                    # Trim ref audio prefix
+                    wavs_out = []
+                    for i, wav in enumerate(wavs_all):
+                        ref_code_list = voice_clone_prompt_dict.get("ref_code", None)
+                        if ref_code_list is not None and ref_code_list[i] is not None:
+                            ref_len = int(ref_code_list[i].shape[0])
+                            total_len = int(codes_for_decode[i].shape[0])
+                            cut = int(ref_len / max(total_len, 1) * wav.shape[0])
+                            wavs_out.append(wav[cut:])
+                        else:
+                            wavs_out.append(wav)
+                    
+                    result_queue.put(("ok", wavs_out, fs))
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    result_queue.put(("error", e, None))
+            
+            thread = Thread(target=gen_thread)
             thread.start()
             
             def stream_generator():
-                # Setup Config IDs
-                eos_token_id = self.model.generation_config.eos_token_id
-                if isinstance(eos_token_id, list):
-                    eos_token_id = eos_token_id[0]
-                
-                talker_cfg = getattr(self.model.config, "talker_config", None)
-                pad_id = 0
-                codec_eos = None
-                if talker_cfg:
-                    pad_id = getattr(talker_cfg, "codec_pad_id", 0)
-                    codec_eos = getattr(talker_cfg, "codec_eos_token_id", None)
-                
-                batch_buffer = [] 
-                
-                for new_token in streamer:
-                    # new_token: [Batch, 1]
-                    try:
-                        token_val = new_token.item()
-                        # Check EOS (Text and Codec)
-                        if token_val == eos_token_id:
-                            break
-                        if codec_eos is not None and token_val == codec_eos:
-                            break
-                        if token_val > 65535: # Safety
-                            continue
-
-                        batch_buffer.append(new_token)
-                        
-                        # Process every 2 tokens (or whatever chunk size)
-                        # Decoding 1 token fails with RoPE? Try 2.
-                        if len(batch_buffer) >= 2:
-                            # Stack: [Batch, 2]? 
-                            # new_token is [B, 1].
-                            # cat(batch_buffer, dim=1) -> [B, 2]
-                            
-                            seq_codes = torch.cat(batch_buffer, dim=1) # [B, 2]
-                            batch_buffer = [] # Clear
-                            
-                            # Pad Layers 1-15
-                            # seq_codes: [B, Seq]
-                            # Unsqueeze to [B, 1, Seq]
-                            ac = seq_codes.unsqueeze(1) 
-                            
-                            device = ac.device
-                            dtype = ac.dtype
-                            
-                            # Padding: [B, 15, Seq]
-                            # Use pad_id * ones
-                            padding = torch.full((ac.shape[0], 15, ac.shape[2]), pad_id, device=device, dtype=dtype)
-                            
-                            full_codes = torch.cat([ac, padding], dim=1) # [B, 16, Seq]
-                            
-                            # Decode
-                            wavs_chunk, _ = self.model.speech_tokenizer.decode([{"audio_codes": full_codes}])
-                            # Output is [B, AudioSamples]
-                            
-                            # Yield
-                            yield wavs_chunk[0]
-                            
-                    except Exception as e:
-                        # print(f"Stream Error: {e}")
-                        pass
-                
-                # Flush remaining buffer
-                if batch_buffer:
-                    try:
-                        seq_codes = torch.cat(batch_buffer, dim=1)
-                        if seq_codes.shape[1] > 0:
-                             ac = seq_codes.unsqueeze(1)
-                             padding = torch.full((ac.shape[0], 15, ac.shape[2]), pad_id, device=ac.device, dtype=ac.dtype)
-                             full_codes = torch.cat([ac, padding], dim=1)
-                             wavs_chunk, _ = self.model.speech_tokenizer.decode([{"audio_codes": full_codes}])
-                             yield wavs_chunk[0]
-                    except:
-                        pass
-                
+                result = result_queue.get()  # Block until generation done
                 thread.join()
+                
+                if result[0] == "ok":
+                    wavs_out, fs = result[1], result[2]
+                    for wav in wavs_out:
+                        yield wav
+                # else: error, yield nothing
             
             return stream_generator(), 24000
+
 
         # BLOCKING MODE
         talker_codes_list, _ = self.model.generate(

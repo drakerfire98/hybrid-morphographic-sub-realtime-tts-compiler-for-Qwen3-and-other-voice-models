@@ -85,16 +85,26 @@ class Qwen3TTSTokenizer:
         AutoModel.register(Qwen3TTSTokenizerV2Config, Qwen3TTSTokenizerV2Model)
 
         inst.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
+        # FIX: Prevent meta tensors by loading to CPU first, then moving to GPU
+        kwargs.setdefault('low_cpu_mem_usage', False)
+        target_device = kwargs.pop('device_map', None)  # Extract device_map
+        
+        # Load model to CPU first (materializes weights)
         inst.model = AutoModel.from_pretrained(pretrained_model_name_or_path, **kwargs)
         inst.config = inst.model.config
 
-        inst.device = getattr(inst.model, "device", None)
-        if inst.device is None:
-            # fallback: infer from first parameter device
-            try:
-                inst.device = next(inst.model.parameters()).device
-            except StopIteration:
-                inst.device = torch.device("cpu")
+        # Move to target device AFTER weights are materialized
+        if target_device:
+            # Use .cuda() since .to() can fail with some model states
+            inst.model = inst.model.cuda()
+            inst.device = torch.device("cuda:0")
+        else:
+            inst.device = getattr(inst.model, "device", None)
+            if inst.device is None:
+                try:
+                    inst.device = next(inst.model.parameters()).device
+                except StopIteration:
+                    inst.device = torch.device("cpu")
 
         return inst
 
