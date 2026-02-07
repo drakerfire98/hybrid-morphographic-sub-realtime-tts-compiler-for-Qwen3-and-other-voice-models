@@ -1704,7 +1704,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 num_layers = len(cp_model.layers)
                 
                 # HYBRID: sequential for first SEQ_GROUPS, crossbar for rest
-                SEQ_GROUPS = 4  # sequential groups (core voice identity)
+                SEQ_GROUPS = 5  # sweet spot: 'awesome' quality at RTF~1.01
                 
                 # === PREFILL: positions [0, 1] ===
                 prefill_input = torch.cat((past_hidden, last_id_hidden), dim=1)
