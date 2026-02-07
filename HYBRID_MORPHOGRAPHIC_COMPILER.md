@@ -2,7 +2,7 @@
 
 **Achieving RTF 0.82 on Qwen3-TTS with Preserved Voice Cloning Quality**
 
-*Authors: NeoGa & Yuri AI*  
+*Authors: Drake Centory & Yuri (AI Assistant)*  
 *Date: February 6, 2026*  
 *Repository: [comfy_qwen_tts](https://github.com/VincentNeemie/comfy_qwen_tts)*
 
@@ -382,7 +382,7 @@ Special thanks to the Qwen3-TTS team for the excellent base model.
 ```bibtex
 @techreport{morphographic2026,
   title={Hybrid Morphographic Compilation for Sub-Real-Time Neural Codec TTS},
-  author={NeoGa and Yuri AI},
+  author={Centory, Drake and Yuri, AI Assistant},
   year={2026},
   month={February},
   institution={Cloud VTuber Project},
