@@ -1701,64 +1701,110 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 
                 mc = self._morph_cache
                 cos_full, sin_full = mc['cos'], mc['sin']
-                num_layers = len(cp_model.layers)
                 
-                # === PREFILL: positions [0, 1] ===
-                prefill_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-                prefill_input = cp.small_to_mtp_projection(prefill_input)
+                # ═══════════════════════════════════════════════════
+                # PHASE 1: CROSSBAR DRAFT — get probability fence
+                # One forward + fused einsum → draft tokens + top-K mask
+                # ═══════════════════════════════════════════════════
+                draft_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+                draft_input = cp.small_to_mtp_projection(draft_input)
                 
-                kv_cache = DynamicCache()
+                # Forward through layers (no KV cache needed for draft)
+                h = draft_input
                 cos_pre = cos_full[:, :2, :]
                 sin_pre = sin_full[:, :2, :]
-                
-                # With flash_attention_2, pass None as attention_mask
-                # The kernel handles causality internally
-                h = prefill_input
                 for layer in cp_model.layers:
                     layer_out = layer(
                         h, attention_mask=None,
                         position_ids=mc['prefill_pos_ids'],
-                        past_key_values=kv_cache, use_cache=True,
+                        past_key_values=None, use_cache=False,
                         cache_position=mc['prefill_cache_pos'],
                         position_embeddings=(cos_pre, sin_pre),
                     )
                     h = layer_out[0]
                 h = cp_model.norm(h)
+                draft_hidden = h[:, -1, :]  # [B, H]
                 
-                token_0 = _sample(cp.lm_head[0](h[:, -1, :]))
-                pred_tokens = [token_0]
+                # Fused crossbar: all 15 lm_heads at once
+                if not hasattr(self, '_crossbar_weight'):
+                    self._crossbar_weight = torch.stack(
+                        [cp.lm_head[i].weight.data for i in range(total_groups)]
+                    )  # [15, V, H]
+                draft_logits = torch.einsum('gvh,bh->bgv', self._crossbar_weight, draft_hidden)
+                # [B, 15, V]
                 
-                # === DECODE: positions [2..16], one at a time ===
-                prev_token = token_0
-                for step in range(1, total_groups):
-                    pos = step + 1
+                # Build probability fence: top-K valid tokens per position
+                FENCE_K = 64  # keep top 64 candidates per position
+                fence_vals, _ = torch.topk(draft_logits, FENCE_K, dim=-1)
+                fence_threshold = fence_vals[..., -1:]  # [B, 15, 1]
+                valid_mask = draft_logits >= fence_threshold  # [B, 15, V]
+                
+                # Sample draft tokens (greedy from crossbar)
+                draft_tokens = draft_logits.argmax(dim=-1)  # [B, 15]
+                
+                # ═══════════════════════════════════════════════════
+                # PHASE 2: ITERATIVE REFINEMENT (protein folding)
+                # Each round: embed → prefill forward → constrained sample
+                # Multiple rounds converge to correct tokens
+                # ═══════════════════════════════════════════════════
+                N_REFINE = 5  # refinement rounds (converge like AlphaFold recycling)
+                current_tokens = draft_tokens
+                
+                # Pre-compute full-sequence rotary
+                full_cache_pos = torch.arange(0, 2 + total_groups, device=device)
+                full_pos_ids = full_cache_pos.unsqueeze(0)
+                cos_all = cos_full[:, :2 + total_groups, :]
+                sin_all = sin_full[:, :2 + total_groups, :]
+                
+                for refine_round in range(N_REFINE):
+                    # Build full input: [past_hidden, L0_embed, L1_embed, ..., L14_embed]
+                    refine_embeds = [embed_layers[i](current_tokens[:, i:i+1]) for i in range(total_groups)]
+                    full_input = torch.cat([past_hidden, last_id_hidden] + refine_embeds, dim=1)
+                    full_input = cp.small_to_mtp_projection(full_input)  # [B, 17, H_cp]
                     
-                    step_embed = embed_layers[step - 1](prev_token)
-                    step_embed = cp.small_to_mtp_projection(step_embed)
-                    
-                    cos_step = cos_full[:, pos:pos+1, :]
-                    sin_step = sin_full[:, pos:pos+1, :]
-                    
-                    h = step_embed
+                    # One prefill forward with full causal context
+                    h = full_input
                     for layer in cp_model.layers:
                         layer_out = layer(
                             h, attention_mask=None,
-                            position_ids=mc['pos_ids'][pos],
-                            past_key_values=kv_cache, use_cache=True,
-                            cache_position=mc['cache_pos'][pos],
-                            position_embeddings=(cos_step, sin_step),
+                            position_ids=full_pos_ids,
+                            past_key_values=None, use_cache=False,
+                            cache_position=full_cache_pos,
+                            position_embeddings=(cos_all, sin_all),
                         )
                         h = layer_out[0]
                     h = cp_model.norm(h)
                     
-                    token_i = _sample(cp.lm_head[step](h[:, -1, :]))
-                    pred_tokens.append(token_i)
-                    prev_token = token_i
+                    # Each position's lm_head → constrained by fence
+                    corrected_logits = []
+                    for i in range(total_groups):
+                        l_i = cp.lm_head[i](h[:, i + 1, :])  # position i+1 → lm_head[i]
+                        # Apply probability fence
+                        l_i = torch.where(valid_mask[:, i, :], l_i, torch.tensor(float('-inf'), device=device))
+                        corrected_logits.append(l_i)
+                    corrected_logits = torch.stack(corrected_logits, dim=1)  # [B, 15, V]
+                    
+                    # Sample corrected tokens
+                    if temp > 0:
+                        corrected_logits = corrected_logits / temp
+                    if _top_k > 0:
+                        top_vals, _ = torch.topk(corrected_logits, min(_top_k, corrected_logits.size(-1)), dim=-1)
+                        corrected_logits = torch.where(corrected_logits < top_vals[..., -1:], float('-inf'), corrected_logits)
+                    
+                    if subtalker_dosample:
+                        probs = torch.softmax(corrected_logits, dim=-1)
+                        current_tokens = torch.multinomial(
+                            probs.view(-1, probs.size(-1)), 1
+                        ).view(batch_size, total_groups)
+                    else:
+                        current_tokens = corrected_logits.argmax(dim=-1)
                 
-                # Build codec_ids and embeddings
-                pred_seqs = torch.cat(pred_tokens, dim=-1)
-                codec_ids = torch.cat((input_ids, pred_seqs), dim=-1)
-                real_embeds = [embed_layers[i](pred_seqs[:, i:i+1]) for i in range(total_groups)]
+                # ═══════════════════════════════════════════════════
+                # PHASE 3: Build final codec_ids and embeddings
+                # ═══════════════════════════════════════════════════
+                pred_tokens_final = current_tokens  # [B, 15]
+                codec_ids = torch.cat((input_ids, pred_tokens_final), dim=-1)
+                real_embeds = [embed_layers[i](pred_tokens_final[:, i:i+1]) for i in range(total_groups)]
                 codec_hiddens = torch.cat([last_id_hidden] + real_embeds, dim=1)
             
             elif actual_steps > 0:
