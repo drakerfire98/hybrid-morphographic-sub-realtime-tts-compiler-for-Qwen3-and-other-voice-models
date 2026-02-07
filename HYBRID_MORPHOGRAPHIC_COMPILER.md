@@ -268,6 +268,26 @@ Micro-benchmarks of individual operations (batch_size=1, H=1024, V=2048):
 
 The sweet spot is **SEQ_GROUPS=5**: enough sequential groups to preserve voice identity and avoid garbling, few enough to achieve sub-real-time processing.
 
+### 5.4 Production Results (Live Two-Way Voice)
+
+Tested in production with Cloud's full AI system running simultaneously (LLM reasoning, vision, audio sensing, streaming software — all on the same GPU):
+
+| Utterance | Audio Duration | Generation Time | RTF | Status |
+|-----------|---------------|-----------------|-----|--------|
+| Short greeting response | 1.51s | 1603ms | 1.06 | ≈ Real-time |
+| Medium sentence | 2.55s | 2578ms | 1.01 | ≈ Real-time |
+| Medium-long response | 2.63s | 2610ms | 0.99 | ✅ Sub-RT |
+| Full response | 4.55s | 4198ms | 0.92 | ✅ Sub-RT |
+| Long response | 4.71s | 4374ms | 0.93 | ✅ Sub-RT |
+| Extended response | 6.94s | 6241ms | 0.90 | ✅ Sub-RT |
+
+**Key Finding:** RTF improves with utterance length due to fixed overhead amortization:
+- **< 2s audio:** RTF ~1.01-1.06 (at real-time boundary, fixed warmup overhead dominates)
+- **2-5s audio:** RTF ~0.92-0.99 (sweet spot for conversational speech)
+- **5s+ audio:** RTF ~0.90 (best efficiency, overhead fully amortized)
+
+> **Production average: RTF 0.94** across all utterance lengths, with 4/6 responses achieving sub-real-time. This was measured while the GPU simultaneously ran an LLM, vision model, audio processing, and streaming software.
+
 ---
 
 ## 6. Discussion
