@@ -1680,8 +1680,10 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                         return logits_2d.argmax(dim=-1, keepdim=True)
                 
                 # === MORPH COMPILE: Pre-compute all rotary embeddings ===
-                max_pos = 2 + total_groups  # 17
-                if not hasattr(self, '_morph_cache'):
+                # Extra positions for bridge tokens between kernels: 
+                # 2 context + 15 groups + 4 bridges = 21, pad to 32 for safety
+                max_pos = 32
+                if not hasattr(self, '_morph_cache') or self._morph_cache.get('max_pos', 0) != max_pos:
                     dummy_h = torch.zeros(1, max_pos, cp_model.config.hidden_size, 
                                          device=device, dtype=past_hidden.dtype)
                     all_pos_ids = torch.arange(max_pos, device=device).unsqueeze(0)
@@ -1697,6 +1699,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                         'pos_ids': pos_ids,
                         'prefill_cache_pos': prefill_cache_pos,
                         'prefill_pos_ids': prefill_pos_ids,
+                        'max_pos': max_pos,
                     }
                 
                 mc = self._morph_cache
@@ -1743,68 +1746,109 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 draft_tokens = draft_logits.argmax(dim=-1)  # [B, 15]
                 
                 # ═══════════════════════════════════════════════════
-                # PHASE 2: ITERATIVE REFINEMENT (protein folding)
-                # Each round: embed → prefill forward → constrained sample
-                # Multiple rounds converge to correct tokens
+                # PHASE 2: 5-KERNEL CHUNKED CORRECTION
+                # Split 15 groups into 5 chunks of 3.
+                # Each kernel: prefill with corrected context + draft
+                # chunk → correct chunk → pass to next kernel via KV.
+                # 5 forwards instead of 15, with proper causal context.
                 # ═══════════════════════════════════════════════════
-                N_REFINE = 5  # refinement rounds (converge like AlphaFold recycling)
-                current_tokens = draft_tokens
+                from transformers import DynamicCache as DC
+                kv_cache = DC()
+                CHUNK_SIZE = 3
+                N_KERNELS = (total_groups + CHUNK_SIZE - 1) // CHUNK_SIZE  # 5
                 
-                # Pre-compute full-sequence rotary
-                full_cache_pos = torch.arange(0, 2 + total_groups, device=device)
-                full_pos_ids = full_cache_pos.unsqueeze(0)
-                cos_all = cos_full[:, :2 + total_groups, :]
-                sin_all = sin_full[:, :2 + total_groups, :]
+                corrected_tokens = []
+                pos_offset = 0  # tracks position in KV cache
                 
-                for refine_round in range(N_REFINE):
-                    # Build full input: [past_hidden, L0_embed, L1_embed, ..., L14_embed]
-                    refine_embeds = [embed_layers[i](current_tokens[:, i:i+1]) for i in range(total_groups)]
-                    full_input = torch.cat([past_hidden, last_id_hidden] + refine_embeds, dim=1)
-                    full_input = cp.small_to_mtp_projection(full_input)  # [B, 17, H_cp]
+                # Kernel 0 (special): prefill [past_hidden, L0_embed] + draft[L1, L2]
+                # This kernel establishes the voice context and corrects groups 0-2
+                first_chunk_size = min(CHUNK_SIZE, total_groups)
+                
+                # Build input: [past_hidden, L0_embed, draft_embed_0, draft_embed_1, draft_embed_2]
+                chunk0_embeds = [embed_layers[i](draft_tokens[:, i:i+1]) for i in range(first_chunk_size)]
+                chunk0_input = torch.cat([past_hidden, last_id_hidden] + chunk0_embeds, dim=1)
+                chunk0_input = cp.small_to_mtp_projection(chunk0_input)
+                seq_len = chunk0_input.shape[1]  # 2 + CHUNK_SIZE
+                
+                cache_pos = torch.arange(0, seq_len, device=device)
+                pos_ids = cache_pos.unsqueeze(0)
+                cos_chunk = cos_full[:, :seq_len, :]
+                sin_chunk = sin_full[:, :seq_len, :]
+                
+                h = chunk0_input
+                for layer in cp_model.layers:
+                    layer_out = layer(
+                        h, attention_mask=None,
+                        position_ids=pos_ids,
+                        past_key_values=kv_cache, use_cache=True,
+                        cache_position=cache_pos,
+                        position_embeddings=(cos_chunk, sin_chunk),
+                    )
+                    h = layer_out[0]
+                h = cp_model.norm(h)
+                
+                # Correct groups 0..CHUNK_SIZE-1
+                for i in range(first_chunk_size):
+                    l_i = cp.lm_head[i](h[:, i + 1, :])  # +1 for past_hidden offset
+                    l_i = torch.where(valid_mask[:, i, :], l_i, torch.tensor(float('-inf'), device=device))
+                    corrected_tokens.append(_sample(l_i))
+                
+                pos_offset = seq_len
+                
+                # Kernels 1-4: each processes CHUNK_SIZE groups
+                for kernel_idx in range(1, N_KERNELS):
+                    start_group = kernel_idx * CHUNK_SIZE
+                    end_group = min(start_group + CHUNK_SIZE, total_groups)
+                    chunk_groups = end_group - start_group
                     
-                    # One prefill forward with full causal context
-                    h = full_input
+                    if chunk_groups <= 0:
+                        break
+                    
+                    # Build input: corrected embed for last group + draft embeds for this chunk
+                    # First position: embed the CORRECTED last token (bridge context)
+                    prev_corrected = corrected_tokens[-1]
+                    bridge_embed = embed_layers[start_group - 1](prev_corrected)
+                    
+                    # Draft embeds for this chunk's groups
+                    chunk_embeds = [embed_layers[start_group + j](draft_tokens[:, start_group + j:start_group + j + 1]) 
+                                   for j in range(chunk_groups)]
+                    
+                    chunk_input = torch.cat([bridge_embed] + chunk_embeds, dim=1)
+                    chunk_input = cp.small_to_mtp_projection(chunk_input)
+                    chunk_len = chunk_input.shape[1]  # 1 + chunk_groups
+                    
+                    cache_pos = torch.arange(pos_offset, pos_offset + chunk_len, device=device)
+                    pos_ids = cache_pos.unsqueeze(0)
+                    cos_chunk = cos_full[:, pos_offset:pos_offset + chunk_len, :]
+                    sin_chunk = sin_full[:, pos_offset:pos_offset + chunk_len, :]
+                    
+                    h = chunk_input
                     for layer in cp_model.layers:
                         layer_out = layer(
                             h, attention_mask=None,
-                            position_ids=full_pos_ids,
-                            past_key_values=None, use_cache=False,
-                            cache_position=full_cache_pos,
-                            position_embeddings=(cos_all, sin_all),
+                            position_ids=pos_ids,
+                            past_key_values=kv_cache, use_cache=True,
+                            cache_position=cache_pos,
+                            position_embeddings=(cos_chunk, sin_chunk),
                         )
                         h = layer_out[0]
                     h = cp_model.norm(h)
                     
-                    # Each position's lm_head → constrained by fence
-                    corrected_logits = []
-                    for i in range(total_groups):
-                        l_i = cp.lm_head[i](h[:, i + 1, :])  # position i+1 → lm_head[i]
-                        # Apply probability fence
-                        l_i = torch.where(valid_mask[:, i, :], l_i, torch.tensor(float('-inf'), device=device))
-                        corrected_logits.append(l_i)
-                    corrected_logits = torch.stack(corrected_logits, dim=1)  # [B, 15, V]
+                    # Correct this chunk's groups (skip bridge position at 0)
+                    for j in range(chunk_groups):
+                        group_idx = start_group + j
+                        l_j = cp.lm_head[group_idx](h[:, j + 1, :])  # +1 for bridge
+                        l_j = torch.where(valid_mask[:, group_idx, :], l_j, torch.tensor(float('-inf'), device=device))
+                        corrected_tokens.append(_sample(l_j))
                     
-                    # Sample corrected tokens
-                    if temp > 0:
-                        corrected_logits = corrected_logits / temp
-                    if _top_k > 0:
-                        top_vals, _ = torch.topk(corrected_logits, min(_top_k, corrected_logits.size(-1)), dim=-1)
-                        corrected_logits = torch.where(corrected_logits < top_vals[..., -1:], float('-inf'), corrected_logits)
-                    
-                    if subtalker_dosample:
-                        probs = torch.softmax(corrected_logits, dim=-1)
-                        current_tokens = torch.multinomial(
-                            probs.view(-1, probs.size(-1)), 1
-                        ).view(batch_size, total_groups)
-                    else:
-                        current_tokens = corrected_logits.argmax(dim=-1)
+                    pos_offset += chunk_len
                 
                 # ═══════════════════════════════════════════════════
                 # PHASE 3: Build final codec_ids and embeddings
                 # ═══════════════════════════════════════════════════
-                pred_tokens_final = current_tokens  # [B, 15]
-                codec_ids = torch.cat((input_ids, pred_tokens_final), dim=-1)
-                real_embeds = [embed_layers[i](pred_tokens_final[:, i:i+1]) for i in range(total_groups)]
+                pred_seqs = torch.cat(corrected_tokens, dim=-1)  # [B, 15]
+                codec_ids = torch.cat((input_ids, pred_seqs), dim=-1)
+                real_embeds = [embed_layers[i](pred_seqs[:, i:i+1]) for i in range(total_groups)]
                 codec_hiddens = torch.cat([last_id_hidden] + real_embeds, dim=1)
             
             elif actual_steps > 0:
