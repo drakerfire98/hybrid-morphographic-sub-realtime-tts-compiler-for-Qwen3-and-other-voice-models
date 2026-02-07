@@ -1704,7 +1704,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 num_layers = len(cp_model.layers)
                 
                 # HYBRID: sequential for first SEQ_GROUPS, crossbar for rest
-                SEQ_GROUPS = 7  # sequential groups (voice identity)
+                SEQ_GROUPS = 5  # sequential groups (voice identity + core spectral)
                 
                 # === PREFILL: positions [0, 1] ===
                 prefill_input = torch.cat((past_hidden, last_id_hidden), dim=1)
@@ -1763,8 +1763,9 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                 # groups in one shot via fused lm_head projections
                 if SEQ_GROUPS < total_groups:
                     remaining = total_groups - SEQ_GROUPS
-                    # Stack remaining lm_head weights
-                    if not hasattr(self, '_crossbar_tail_weight'):
+                    # Stack remaining lm_head weights (re-compute if SEQ_GROUPS changed)
+                    if not hasattr(self, '_crossbar_tail_weight') or self._crossbar_tail_start != SEQ_GROUPS:
+                        self._crossbar_tail_start = SEQ_GROUPS
                         self._crossbar_tail_weight = torch.stack(
                             [cp.lm_head[i].weight.data for i in range(SEQ_GROUPS, total_groups)]
                         )  # [remaining, V, H]
