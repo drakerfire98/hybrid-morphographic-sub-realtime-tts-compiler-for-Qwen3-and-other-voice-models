@@ -300,13 +300,49 @@ Potential targets include EnCodec-based models, SoundStream-based models, and fu
 
 ## 7. Reproducing Results
 
-### 7.1 Requirements
+### 7.1 Dependencies
 
-- Python 3.10+
-- PyTorch 2.9+ with CUDA
-- `flash-attn` (compiled for your PyTorch version)
-- `scipy` (for Butterworth filter)
-- NVIDIA GPU with ≥4GB VRAM
+**Base Model:**
+| Dependency | Link | Purpose |
+|-----------|------|---------|
+| Qwen3-TTS-12Hz-0.6B-Base | [HuggingFace](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base) | Base TTS model (~1.2GB download) |
+| comfy_qwen_tts | [GitHub](https://github.com/flybirdxx/ComfyUI-Qwen-TTS) | Python inference wrapper (contains `modeling_qwen3_tts.py` where the morph compiler lives) |
+
+**Python Packages:**
+| Package | Version | Link | Purpose |
+|---------|---------|------|---------|
+| [PyTorch](https://pytorch.org/) | ≥2.9.0 | [Install Guide](https://pytorch.org/get-started/locally/) | Core ML framework (must match CUDA version) |
+| [flash-attn](https://github.com/Dao-AILab/flash-attention) | ≥2.5.0 | [GitHub](https://github.com/Dao-AILab/flash-attention) | Flash Attention 2 — required for `attention_mask=None` optimization |
+| [scipy](https://scipy.org/) | ≥1.10.0 | [PyPI](https://pypi.org/project/scipy/) | Butterworth low-pass filter (`butter`, `sosfilt`) |
+| [numpy](https://numpy.org/) | ≥1.24.0 | [PyPI](https://pypi.org/project/numpy/) | Audio array processing |
+| [soundfile](https://python-soundfile.readthedocs.io/) | ≥0.12.0 | [PyPI](https://pypi.org/project/soundfile/) | WAV file I/O |
+| [sounddevice](https://python-sounddevice.readthedocs.io/) | ≥0.4.6 | [PyPI](https://pypi.org/project/sounddevice/) | Real-time audio playback (optional) |
+| [transformers](https://huggingface.co/docs/transformers/) | ≥4.40.0 | [PyPI](https://pypi.org/project/transformers/) | HuggingFace model loading (`DynamicCache`, tokenizers) |
+
+**Hardware:**
+| Component | Minimum | Recommended |
+|-----------|---------|-------------|
+| GPU | NVIDIA with ≥4GB VRAM | RTX 3060+ (6GB+) |
+| CUDA | 11.8+ | 12.1+ |
+| RAM | 8GB | 16GB+ |
+
+**Quick Install:**
+```bash
+# Install PyTorch with CUDA (check https://pytorch.org for your CUDA version)
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Install flash-attention (requires CUDA toolkit)
+pip install flash-attn --no-build-isolation
+
+# Install remaining dependencies
+pip install scipy numpy soundfile sounddevice transformers
+
+# Install the Qwen TTS wrapper
+pip install qwen-tts
+
+# Download the model (auto-downloads on first use, or manually):
+# huggingface-cli download Qwen/Qwen3-TTS-12Hz-0.6B-Base
+```
 
 **Measured VRAM Usage (bfloat16):**
 
@@ -396,7 +432,7 @@ Special thanks to the Qwen3-TTS team for the excellent base model.
   year={2026},
   month={February},
   institution={Cloud VTuber Project},
-  url={https://github.com/VincentNeemie/comfy_qwen_tts}
+  url={https://github.com/drakerfire98/hybrid-morphographic-sub-realtime-tts-compiler}
 }
 ```
 
