@@ -1646,19 +1646,23 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             
             if use_crossbar and actual_steps > 0:
                 # ═══════════════════════════════════════════════════════
-                # FAST SEQUENTIAL: Custom tight loop (no HF overhead)
-                # Same 15 steps as original, but bypasses generate()
-                # Direct forward calls with matching sampling params
+                # MORPH CODEC COMPILER: Custom Python-native compiler
+                # Pre-computes cache_position, position_ids, rotary_emb,
+                # and causal masks. Calls decoder layers directly — no
+                # model.forward() overhead per step.
+                # Inspired by what torch.compile optimizes, done in Python.
                 # ═══════════════════════════════════════════════════════
                 from transformers import DynamicCache
-                embed_layers = self.code_predictor.get_input_embeddings()
+                cp = self.code_predictor
+                cp_model = cp.model  # the small transformer
+                embed_layers = cp.get_input_embeddings()
                 batch_size = input_ids.shape[0]
+                device = input_ids.device
                 temp = subtalker_temperature if subtalker_temperature else 1.0
                 _top_k = subtalker_top_k if subtalker_top_k else 0
                 _top_p = subtalker_top_p if subtalker_top_p else 1.0
                 
                 def _sample(logits_2d):
-                    """Apply temperature + top_k + top_p + sample (matches HF)"""
                     if temp > 0:
                         logits_2d = logits_2d / temp
                     if _top_k > 0:
@@ -1675,41 +1679,84 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
                     else:
                         return logits_2d.argmax(dim=-1, keepdim=True)
                 
-                # Step 0: Prefill with [past_hidden, L0_embed]
+                # === MORPH COMPILE: Pre-compute all rotary embeddings ===
+                max_pos = 2 + total_groups  # 17
+                if not hasattr(self, '_morph_cache'):
+                    dummy_h = torch.zeros(1, max_pos, cp_model.config.hidden_size, 
+                                         device=device, dtype=past_hidden.dtype)
+                    all_pos_ids = torch.arange(max_pos, device=device).unsqueeze(0)
+                    cos_full, sin_full = cp_model.rotary_emb(dummy_h, all_pos_ids)
+                    # Pre-compute per-step cache_position tensors
+                    cache_positions = [torch.tensor([i], device=device) for i in range(max_pos)]
+                    pos_ids = [torch.tensor([[i]], device=device) for i in range(max_pos)]
+                    prefill_cache_pos = torch.arange(0, 2, device=device)
+                    prefill_pos_ids = prefill_cache_pos.unsqueeze(0)
+                    self._morph_cache = {
+                        'cos': cos_full, 'sin': sin_full,
+                        'cache_pos': cache_positions,
+                        'pos_ids': pos_ids,
+                        'prefill_cache_pos': prefill_cache_pos,
+                        'prefill_pos_ids': prefill_pos_ids,
+                    }
+                
+                mc = self._morph_cache
+                cos_full, sin_full = mc['cos'], mc['sin']
+                num_layers = len(cp_model.layers)
+                
+                # === PREFILL: positions [0, 1] ===
                 prefill_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-                prefill_input = self.code_predictor.small_to_mtp_projection(prefill_input)
+                prefill_input = cp.small_to_mtp_projection(prefill_input)
                 
                 kv_cache = DynamicCache()
-                prefill_out = self.code_predictor.model(
-                    input_ids=None, inputs_embeds=prefill_input,
-                    past_key_values=kv_cache, use_cache=True,
-                )
-                h = prefill_out.last_hidden_state[:, -1, :]
-                token_0 = _sample(self.code_predictor.lm_head[0](h))
+                cos_pre = cos_full[:, :2, :]
+                sin_pre = sin_full[:, :2, :]
                 
+                # With flash_attention_2, pass None as attention_mask
+                # The kernel handles causality internally
+                h = prefill_input
+                for layer in cp_model.layers:
+                    layer_out = layer(
+                        h, attention_mask=None,
+                        position_ids=mc['prefill_pos_ids'],
+                        past_key_values=kv_cache, use_cache=True,
+                        cache_position=mc['prefill_cache_pos'],
+                        position_embeddings=(cos_pre, sin_pre),
+                    )
+                    h = layer_out[0]
+                h = cp_model.norm(h)
+                
+                token_0 = _sample(cp.lm_head[0](h[:, -1, :]))
                 pred_tokens = [token_0]
-                kv_cache = prefill_out.past_key_values
                 
-                # Steps 1-14: Sequential generation (tight loop)
+                # === DECODE: positions [2..16], one at a time ===
                 prev_token = token_0
                 for step in range(1, total_groups):
+                    pos = step + 1
+                    
                     step_embed = embed_layers[step - 1](prev_token)
-                    step_embed = self.code_predictor.small_to_mtp_projection(step_embed)
+                    step_embed = cp.small_to_mtp_projection(step_embed)
                     
-                    step_out = self.code_predictor.model(
-                        input_ids=None, inputs_embeds=step_embed,
-                        past_key_values=kv_cache, use_cache=True,
-                    )
+                    cos_step = cos_full[:, pos:pos+1, :]
+                    sin_step = sin_full[:, pos:pos+1, :]
                     
-                    h = step_out.last_hidden_state[:, -1, :]
-                    token_i = _sample(self.code_predictor.lm_head[step](h))
+                    h = step_embed
+                    for layer in cp_model.layers:
+                        layer_out = layer(
+                            h, attention_mask=None,
+                            position_ids=mc['pos_ids'][pos],
+                            past_key_values=kv_cache, use_cache=True,
+                            cache_position=mc['cache_pos'][pos],
+                            position_embeddings=(cos_step, sin_step),
+                        )
+                        h = layer_out[0]
+                    h = cp_model.norm(h)
                     
+                    token_i = _sample(cp.lm_head[step](h[:, -1, :]))
                     pred_tokens.append(token_i)
-                    kv_cache = step_out.past_key_values
                     prev_token = token_i
                 
                 # Build codec_ids and embeddings
-                pred_seqs = torch.cat(pred_tokens, dim=-1)  # [B, 15]
+                pred_seqs = torch.cat(pred_tokens, dim=-1)
                 codec_ids = torch.cat((input_ids, pred_seqs), dim=-1)
                 real_embeds = [embed_layers[i](pred_seqs[:, i:i+1]) for i in range(total_groups)]
                 codec_hiddens = torch.cat([last_id_hidden] + real_embeds, dim=1)
