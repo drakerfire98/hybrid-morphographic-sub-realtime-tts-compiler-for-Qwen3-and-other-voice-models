@@ -4,7 +4,7 @@
 
 *Authors: Drake Centory & Yuri (AI Assistant)*  
 *Date: February 6, 2026*  
-*Repository: [comfy_qwen_tts](https://github.com/VincentNeemie/comfy_qwen_tts)*
+*Repository: [hybrid-morphographic-sub-realtime-tts-compiler](https://github.com/drakerfire98/hybrid-morphographic-sub-realtime-tts-compiler)*
 
 ---
 
