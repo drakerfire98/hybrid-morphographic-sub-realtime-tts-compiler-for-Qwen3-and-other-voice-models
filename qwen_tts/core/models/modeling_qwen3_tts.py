@@ -1645,52 +1645,73 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             use_crossbar = getattr(self, '_use_crossbar', False)
             
             if use_crossbar and actual_steps > 0:
-                # === CROSSBAR: One transformer pass + parallel lm_heads ===
-                crossbar_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-                crossbar_input = self.code_predictor.small_to_mtp_projection(crossbar_input)
-                
-                # Single forward pass through the small transformer
-                cp_outputs = self.code_predictor.model(
-                    input_ids=None,
-                    inputs_embeds=crossbar_input,
-                    use_cache=False,
-                )
-                cp_hidden = cp_outputs.last_hidden_state[:, -1, :]  # [B, H]
-                
-                # Fused crossbar: all lm_heads at once via stacked matmul
-                # Stack weights: [num_groups, vocab, hidden]
-                if not hasattr(self, '_crossbar_weight'):
-                    self._crossbar_weight = torch.stack(
-                        [self.code_predictor.lm_head[i].weight.data for i in range(total_groups)]
-                    )
-                
-                # Single einsum = 15 matmuls fused into 1 kernel
-                all_logits = torch.einsum('gvh,bh->bgv', self._crossbar_weight, cp_hidden)
-                
-                # Apply temperature + sampling (all groups simultaneously)
-                temp = subtalker_temperature if subtalker_temperature else 1.0
-                if temp > 0:
-                    all_logits = all_logits / temp
-                
-                if subtalker_top_k and subtalker_top_k > 0:
-                    top_k_vals, _ = torch.topk(all_logits, min(subtalker_top_k, all_logits.size(-1)), dim=-1)
-                    threshold = top_k_vals[..., -1:]
-                    all_logits = torch.where(all_logits < threshold, float('-inf'), all_logits)
-                
-                probs = torch.softmax(all_logits, dim=-1)
+                # ═══════════════════════════════════════════════════════
+                # FAST SEQUENTIAL: Custom tight loop (no HF overhead)
+                # Same 15 steps as original, but bypasses generate()
+                # Direct forward calls with matching sampling params
+                # ═══════════════════════════════════════════════════════
+                from transformers import DynamicCache
+                embed_layers = self.code_predictor.get_input_embeddings()
                 batch_size = input_ids.shape[0]
+                temp = subtalker_temperature if subtalker_temperature else 1.0
+                _top_k = subtalker_top_k if subtalker_top_k else 0
+                _top_p = subtalker_top_p if subtalker_top_p else 1.0
                 
-                if subtalker_dosample:
-                    pred_tokens = torch.multinomial(
-                        probs.view(-1, probs.size(-1)), num_samples=1
-                    ).view(batch_size, total_groups)
-                else:
-                    pred_tokens = probs.argmax(dim=-1)  # [B, 15]
+                def _sample(logits_2d):
+                    """Apply temperature + top_k + top_p + sample (matches HF)"""
+                    if temp > 0:
+                        logits_2d = logits_2d / temp
+                    if _top_k > 0:
+                        top_vals, _ = torch.topk(logits_2d, min(_top_k, logits_2d.size(-1)), dim=-1)
+                        logits_2d = torch.where(logits_2d < top_vals[..., -1:], float('-inf'), logits_2d)
+                    if _top_p < 1.0:
+                        sorted_logits, sorted_idx = torch.sort(logits_2d, descending=True)
+                        cum_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                        mask = cum_probs - torch.softmax(sorted_logits, dim=-1) >= _top_p
+                        sorted_logits[mask] = float('-inf')
+                        logits_2d = sorted_logits.scatter(-1, sorted_idx, sorted_logits)
+                    if subtalker_dosample:
+                        return torch.multinomial(torch.softmax(logits_2d, dim=-1), 1)
+                    else:
+                        return logits_2d.argmax(dim=-1, keepdim=True)
+                
+                # Step 0: Prefill with [past_hidden, L0_embed]
+                prefill_input = torch.cat((past_hidden, last_id_hidden), dim=1)
+                prefill_input = self.code_predictor.small_to_mtp_projection(prefill_input)
+                
+                kv_cache = DynamicCache()
+                prefill_out = self.code_predictor.model(
+                    input_ids=None, inputs_embeds=prefill_input,
+                    past_key_values=kv_cache, use_cache=True,
+                )
+                h = prefill_out.last_hidden_state[:, -1, :]
+                token_0 = _sample(self.code_predictor.lm_head[0](h))
+                
+                pred_tokens = [token_0]
+                kv_cache = prefill_out.past_key_values
+                
+                # Steps 1-14: Sequential generation (tight loop)
+                prev_token = token_0
+                for step in range(1, total_groups):
+                    step_embed = embed_layers[step - 1](prev_token)
+                    step_embed = self.code_predictor.small_to_mtp_projection(step_embed)
+                    
+                    step_out = self.code_predictor.model(
+                        input_ids=None, inputs_embeds=step_embed,
+                        past_key_values=kv_cache, use_cache=True,
+                    )
+                    
+                    h = step_out.last_hidden_state[:, -1, :]
+                    token_i = _sample(self.code_predictor.lm_head[step](h))
+                    
+                    pred_tokens.append(token_i)
+                    kv_cache = step_out.past_key_values
+                    prev_token = token_i
                 
                 # Build codec_ids and embeddings
-                embed_layers = self.code_predictor.get_input_embeddings()
-                codec_ids = torch.cat((input_ids, pred_tokens), dim=-1)
-                real_embeds = [embed_layers[i](pred_tokens[:, i:i+1]) for i in range(total_groups)]
+                pred_seqs = torch.cat(pred_tokens, dim=-1)  # [B, 15]
+                codec_ids = torch.cat((input_ids, pred_seqs), dim=-1)
+                real_embeds = [embed_layers[i](pred_seqs[:, i:i+1]) for i in range(total_groups)]
                 codec_hiddens = torch.cat([last_id_hidden] + real_embeds, dim=1)
             
             elif actual_steps > 0:
