@@ -1617,6 +1617,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
         subtalker_top_p=None,
         subtalker_top_k=None,
         subtalker_temperature=None,
+        skip_code_predictor=False,
         **kwargs,
     ) -> CausalLMOutputWithPast:
         r"""
@@ -1634,9 +1635,7 @@ class Qwen3TTSTalkerForConditionalGeneration(Qwen3TTSTalkerTextPreTrainedModel, 
             last_id_hidden = self.get_input_embeddings()(input_ids)
             
             # FAST PATH: Skip NAR code_predictor for streaming (sub-second latency)
-            skip_nar = kwargs.get("skip_code_predictor", False)
-            
-            if not skip_nar:
+            if not skip_code_predictor:
                 # Original: Run code_predictor for high-quality audio
                 predictor_result = self.code_predictor.generate(
                     inputs_embeds=torch.cat((past_hidden, last_id_hidden), dim=1),
@@ -2013,6 +2012,7 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         subtalker_temperature: float = 0.9,
         eos_token_id: Optional[int] = None,
         repetition_penalty: float = 1.05,
+        deferred_nar: bool = False,
         **kwargs,
     ):
         talker_kwargs = {
@@ -2038,6 +2038,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             "output_hidden_states": getattr(kwargs, "output_hidden_states", True),
             "return_dict_in_generate": getattr(kwargs, "return_dict_in_generate", True)
         }
+        if deferred_nar:
+            talker_kwargs["skip_code_predictor"] = True
         if "streamer" in kwargs:
             talker_kwargs["streamer"] = kwargs["streamer"]
         
@@ -2255,6 +2257,59 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         talker_codes = torch.stack([hid[-1] for hid in talker_result.hidden_states if hid[-1] is not None], dim=1)
         talker_hidden_states = torch.cat([hid[0][-1][:, -1:] for hid in talker_result.hidden_states], dim=1)[:, :-1]
+        
+        # ═══════════════════════════════════════════════════════════════
+        # DEFERRED NAR: Batch-predict L1-L15 codes for all tokens at once
+        # During AR, code_predictor was skipped (L1-15 = zeros).
+        # Now we run it as ONE batched call across all time steps.
+        # This turns 42×15=630 sequential passes into 1×15=15 batch passes.
+        # ═══════════════════════════════════════════════════════════════
+        if deferred_nar and talker_codes.shape[1] > 0:
+            try:
+                num_steps = talker_codes.shape[1]
+                # Collect L0 tokens and hidden states for all steps
+                l0_tokens = talker_codes[:, :, 0]  # [B, Seq]
+                
+                # Get L0 embeddings for all tokens: [B, Seq, D]
+                l0_embeds = self.talker.get_input_embeddings()(l0_tokens)
+                
+                # For each token, code_predictor needs [past_hidden, l0_embed]
+                # past_hidden = talker_hidden_states[:, t, :]  (shape [B, D])
+                # l0_embed = l0_embeds[:, t, :]  (shape [B, D])
+                # We batch all time steps together as a larger batch
+                
+                B = talker_codes.shape[0]
+                # Reshape: [B * Seq, 1, D] for past_hidden
+                batch_past = talker_hidden_states.reshape(B * num_steps, 1, -1)
+                # Reshape: [B * Seq, 1, D] for l0_embed  
+                batch_l0 = l0_embeds.reshape(B * num_steps, 1, -1)
+                
+                # Concatenate: [B*Seq, 2, D]
+                batch_inputs = torch.cat([batch_past, batch_l0], dim=1)
+                
+                # Run code_predictor.generate as one big batch
+                with torch.inference_mode():
+                    pred_result = self.talker.code_predictor.generate(
+                        inputs_embeds=batch_inputs,
+                        max_new_tokens=self.config.talker_config.num_code_groups - 1,
+                        do_sample=subtalker_dosample,
+                        top_p=subtalker_top_p,
+                        top_k=subtalker_top_k,
+                        temperature=subtalker_temperature,
+                        output_hidden_states=False,
+                        return_dict_in_generate=True,
+                    )
+                
+                # pred_result.sequences: [B*Seq, 15]
+                pred_codes = pred_result.sequences.reshape(B, num_steps, -1)
+                
+                # Overwrite L1-L15 in talker_codes
+                talker_codes[:, :, 1:] = pred_codes
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                # Fall through with L1-15 = zeros (lower quality but still works)
         
         first_codebook = talker_codes[:, :, 0]
         is_stop_token = (first_codebook ==  self.config.talker_config.codec_eos_token_id)
